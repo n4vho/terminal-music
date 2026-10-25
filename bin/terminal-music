@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""A Linux terminal launcher for Spotatui and Spotify Soloist. Python 3.10+."""
+import argparse
+import fcntl
+import getpass
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+
+def root(variable, fallback):
+    value = os.environ.get(variable, '')
+    return Path(value) if value.startswith('/') else Path.home() / fallback
+
+
+CONFIG = root('XDG_CONFIG_HOME', '.config') / 'terminal-music'
+DATA = root('XDG_DATA_HOME', '.local/share') / 'terminal-music'
+STATE = root('XDG_STATE_HOME', '.local/state') / 'terminal-music'
+CACHE = root('XDG_CACHE_HOME', '.cache') / 'terminal-music'
+BIN = Path.home() / '.local/bin'
+KEY = CONFIG / 'api-key'
+SETTINGS = CONFIG / 'settings.json'
+SPOT_CONFIG = CONFIG / 'spotatui.yml'
+SOLOIST_DATA = DATA / 'soloist'
+RELEASES = 'https://api.github.com/repos/LargeModGames/spotatui/releases/latest'
+
+
+def private_dirs():
+    for path in (CONFIG, DATA, STATE, CACHE):
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.chmod(0o700)
+
+
+def atomic_write(path, content, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as file:
+            file.write(content if isinstance(content, bytes) else content.encode())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def fetch(url):
+    if not url.startswith('https://'):
+        raise RuntimeError('Downloads must use HTTPS')
+    request = urllib.request.Request(url, headers={'User-Agent': 'terminal-music-setup'})
+    with urllib.request.urlopen(request, timeout=90) as response:
+        return response.read()
+
+
+def install_archive(payload, name, destination):
+    # Extract only the expected regular file; never extract paths or symlinks.
+    import io
+    with tarfile.open(fileobj=io.BytesIO(payload), mode='r:gz') as archive:
+        members = [m for m in archive.getmembers()
+                   if m.isfile() and Path(m.name).name == name]
+        if len(members) != 1:
+            raise RuntimeError(f'Archive must contain exactly one regular {name} executable')
+        with archive.extractfile(members[0]) as file:
+            atomic_write(destination, file.read(), 0o755)
+
+
+def binary(name):
+    owned = DATA / 'bin' / name
+    if owned.is_file() and os.access(owned, os.X_OK):
+        return str(owned)
+    found = shutil.which(name)
+    if not found:
+        raise RuntimeError(f'{name} missing. Run terminal-music setup')
+    return found
+
+
+def install_players(update=False):
+    if platform.system() != 'Linux':
+        raise RuntimeError('This installer currently supports Linux only')
+    arch = platform.machine()
+    soloist_arch = {'x86_64': 'x86_64', 'aarch64': 'arm64', 'armv7l': 'arm32'}.get(arch)
+    if not soloist_arch:
+        raise RuntimeError(f'Unsupported Linux architecture: {arch}')
+    try:
+        binary('soloist')
+        needs_soloist = update
+    except RuntimeError:
+        needs_soloist = True
+    if needs_soloist:
+        print('Downloading Soloist directly from Spotify...')
+        url = f'https://soloist-builds.spotifycdn.com/soloist_release_{soloist_arch}.tar.gz'
+        install_archive(fetch(url), 'soloist', DATA / 'bin/soloist')
+    subprocess.run([binary('soloist'), '--version'], check=True)
+    try:
+        binary('spotatui')
+        needs_spotatui = update and (DATA / 'bin/spotatui').exists()
+    except RuntimeError:
+        needs_spotatui = True
+    if needs_spotatui:
+        print('Looking up the official Spotatui release...')
+        release = json.loads(fetch(RELEASES))
+        name = f'spotatui-linux-{arch}.tar.gz'
+        assets = {item['name']: item['browser_download_url'] for item in release['assets']}
+        if name not in assets or 'checksums.txt' not in assets:
+            raise RuntimeError('No matching Spotatui release/checksums. Install Spotatui using '
+                               'https://github.com/LargeModGames/spotatui/releases then rerun setup')
+        payload = fetch(assets[name])
+        checksums = fetch(assets['checksums.txt']).decode()
+        expected = None
+        for line in checksums.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[1].lstrip('*./') == name:
+                expected = fields[0]
+        if expected is None or hashlib.sha256(payload).hexdigest() != expected:
+            raise RuntimeError('Spotatui archive checksum verification failed')
+        install_archive(payload, 'spotatui', DATA / 'bin/spotatui')
+    subprocess.run([binary('spotatui'), '--version'], check=True)
+
+
+def streaming_disabled(text):
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if line == 'behavior:'), None)
+    if start is None:
+        return text.rstrip() + '\nbehavior:\n  enable_streaming: false\n'
+    end = next((i for i in range(start + 1, len(lines))
+                if re.match(r'^[^\s#][^:]*:', lines[i])), len(lines))
+    for i in range(start + 1, end):
+        if re.match(r'^  enable_streaming\s*:', lines[i]):
+            lines[i] = '  enable_streaming: false'
+            return '\n'.join(lines) + '\n'
+    lines.insert(start + 1, '  enable_streaming: false')
+    return '\n'.join(lines) + '\n'
+
+
+def setup(args):
+    private_dirs()
+    install_players()
+    if not KEY.exists() or args.reset_key:
+        if not sys.stdin.isatty():
+            raise RuntimeError('Run setup interactively to enter your Soloist API key')
+        key = getpass.getpass('Paste your Spotify SOLOIST API key (hidden): ').strip()
+        if not key:
+            raise RuntimeError('Empty key; no key saved')
+        atomic_write(KEY, key + '\n')
+    settings = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+    if args.name:
+        settings['device_name'] = args.name
+    settings.setdefault('device_name', 'Terminal-Music')
+    atomic_write(SETTINGS, json.dumps(settings, indent=2) + '\n')
+    if not SPOT_CONFIG.exists():
+        original = root('XDG_CONFIG_HOME', '.config') / 'spotatui/config.yml'
+        text = original.read_text() if original.exists() else ''
+        atomic_write(SPOT_CONFIG, streaming_disabled(text))
+    else:
+        atomic_write(SPOT_CONFIG, streaming_disabled(SPOT_CONFIG.read_text()))
+    print(f'\nSetup saved. Run: terminal-music pair\n'
+          f'On your phone, use Spotify on the same Wi-Fi and select {settings["device_name"]}.\n'
+          'Then run terminal-music, log into Spotatui if prompted, press d, and select that device.\n'
+          f'Your original Spotatui config was preserved. Settings: {CONFIG}')
+
+
+def ctl(*arguments, capture=False):
+    return subprocess.run([binary('soloist'), 'ctl', *arguments, '-D', str(SOLOIST_DATA)],
+                          capture_output=capture, text=True, timeout=10)
+
+
+def running():
+    return 'soloist: running (pid ' in ctl('status', capture=True).stdout
+
+
+def start():
+    private_dirs()
+    if not KEY.exists() or not SETTINGS.exists():
+        raise RuntimeError('Run terminal-music setup first')
+    with (STATE / 'startup.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if running():
+            return
+        key = KEY.read_text().strip()
+        if not key:
+            raise RuntimeError('Empty API key. Run terminal-music setup --reset-key')
+        settings = json.loads(SETTINGS.read_text())
+        command = [binary('soloist'), '-n', settings['device_name'], '-k', key,
+                   '-D', str(SOLOIST_DATA), '-C', str(CACHE / 'soloist'),
+                   '-z', '100', '-w', '127.0.0.1:0']
+        log = STATE / 'soloist.log'
+        with log.open('a') as output:
+            log.chmod(0o600)
+            child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+        for _ in range(100):
+            if child.poll() is not None:
+                raise RuntimeError(f'Soloist exited with code {child.returncode}. '
+                                   f'Check {log}; code 10 means run terminal-music update')
+            if running():
+                return
+            time.sleep(0.1)
+        raise RuntimeError(f'Soloist readiness timed out. Check {log}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command')
+    p = sub.add_parser('setup', help='Install players and securely prompt for your Soloist key')
+    p.add_argument('--name', help='Spotify Connect device name')
+    p.add_argument('--reset-key', action='store_true')
+    for name, help_text in [('pair', 'Start Soloist and show first-pairing instructions'),
+                            ('start', 'Start Soloist in the background'),
+                            ('stop', 'Stop this setup’s Soloist process'),
+                            ('status', 'Show Soloist status'),
+                            ('update', 'Download a current Soloist build'),
+                            ('paths', 'Show configuration and log paths')]:
+        sub.add_parser(name, help=help_text)
+    args = parser.parse_args()
+    if args.command == 'setup':
+        setup(args)
+    elif args.command == 'update':
+        private_dirs()
+        if (SOLOIST_DATA / 'soloist.pid').exists() and running():
+            raise RuntimeError('Run terminal-music stop before updating')
+        install_players(update=True)
+    elif args.command == 'paths':
+        print(f'Config: {CONFIG}\nSpotatui: {SPOT_CONFIG}\nAPI key: {KEY}\n'
+              f'Data: {DATA}\nLog: {STATE / "soloist.log"}')
+    elif args.command == 'status':
+        ctl('status')
+    elif args.command == 'stop':
+        if not running():
+            print('Soloist is not running')
+            return
+        import signal
+        pid = int((SOLOIST_DATA / 'soloist.pid').read_text().strip())
+        if pid <= 1:
+            raise RuntimeError('Invalid daemon PID')
+        executable = Path(f'/proc/{pid}/exe').resolve(strict=True)
+        if executable != Path(binary('soloist')).resolve():
+            raise RuntimeError('PID belongs to a different executable; refusing to stop it')
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            if not running():
+                print('Soloist stopped')
+                return
+            time.sleep(0.1)
+        raise RuntimeError('Soloist has not stopped yet; check status before updating')
+    else:
+        start()
+        if args.command == 'pair':
+            name = json.loads(SETTINGS.read_text())['device_name']
+            print(f'Soloist is running. On Spotify on your phone (same Wi-Fi), select {name}.\n'
+                  'Play a track, then run terminal-music and select the same device with d.')
+        elif args.command != 'start':
+            if not SPOT_CONFIG.exists():
+                raise RuntimeError('Missing Spotatui config; run terminal-music setup')
+            atomic_write(SPOT_CONFIG, streaming_disabled(SPOT_CONFIG.read_text()))
+            os.execv(binary('spotatui'), ['spotatui', '--config', str(SPOT_CONFIG), '--no-update'])
+
+
+if __name__ == '__main__':
+    try:
+        os.umask(0o077)
+        main()
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError, tarfile.TarError) as error:
+        # Never print subprocess command arguments, which may include the key.
+        message = 'A player command failed; check its version and local log' if isinstance(
+            error, subprocess.SubprocessError) else str(error)
+        print(f'terminal-music: {message}', file=sys.stderr)
+        sys.exit(1)
+    except (KeyboardInterrupt, EOFError):
+        print('\nCancelled.', file=sys.stderr)
+        sys.exit(130)
