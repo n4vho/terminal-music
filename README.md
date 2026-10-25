@@ -1,6 +1,8 @@
 # terminal-music
 
-Play Spotify from your terminal with **Spotatui for browsing** and **Spotify Soloist for audio**. Enter your own Soloist API key, pair once, then launch with one command:
+A community setup helper built on **[Spotatui](https://github.com/LargeModGames/spotatui)** by LargeModGames and contributors, and **[Spotify Soloist](https://developer.spotify.com/documentation/soloist)** by Spotify. Those projects provide the music interface and playback engine; this repository contributes installation and launch automation.
+
+Enter your own Soloist API key, pair once, then launch with one command:
 
 ```sh
 terminal-music
@@ -124,7 +126,10 @@ Tests use temporary directories and mocked downloads/processes. They do not acce
 
 ## Credits
 
-- [Spotatui](https://github.com/LargeModGames/spotatui) provides the terminal interface.
-- [Spotify Soloist](https://developer.spotify.com/documentation/soloist) provides official audio playback.
+- **[Spotatui](https://github.com/LargeModGames/spotatui)** — LargeModGames and [all contributors](https://github.com/LargeModGames/spotatui/graphs/contributors) built the terminal interface, library browsing, and playback controls. Its [MIT license](https://github.com/LargeModGames/spotatui/blob/main/LICENSE) credits Alexander Keliris (2021) and LargeModGames (2025).
+- **[Spotify Soloist](https://developer.spotify.com/documentation/soloist)** — Spotify built and distributes the playback engine. It remains subject to Spotify’s terms and is not covered by this repository’s MIT license.
+- **This repository** provides the glue: dependency setup, local configuration, pairing guidance, and process launching. It does not claim authorship of either player.
+
+Please support the upstream projects, credit them when sharing this setup, and report wrapper issues here; report player issues upstream only after reproducing them outside this wrapper. See [third-party notices](THIRD_PARTY.md).
 
 This project is independent and is not affiliated with or endorsed by Spotify or Spotatui. The MIT license here covers only this repository's original code; it does not relicense either player.
